@@ -165,6 +165,177 @@ export function fixBrokenBoldTags(root: HTMLElement) {
 }
 
 /**
+ * Scans for broken nested code blocks where an inner "```" is treated as the closing tag.
+ * Moves orphaned content back into the code block.
+ */
+export function fixNestedCodeBlocks(root: HTMLElement) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  const potentialNodes: Text[] = [];
+  let node: Node | null;
+
+  while ((node = walker.nextNode())) {
+    if (node.textContent?.includes('```')) {
+      const parent = node.parentElement;
+      // Skip if already inside a code block structure
+      if (
+        parent &&
+        (parent.tagName === 'CODE' ||
+          parent.tagName === 'PRE' ||
+          parent.closest('code-block') ||
+          parent.closest('pre'))
+      ) {
+        continue;
+      }
+      potentialNodes.push(node as Text);
+    }
+  }
+
+  if (potentialNodes.length === 0) return;
+
+  // Batch DOM updates using requestAnimationFrame (simulated debounce)
+  requestAnimationFrame(() => {
+    potentialNodes.forEach((textNode) => {
+      if (!textNode.isConnected) return;
+
+      // Identify the container element (usually a <p> or the text node's parent)
+      let currentElement: Node = textNode.parentElement || textNode;
+      // If parent is body (unlikely for text node but possible), stay at text node
+      if (currentElement === document.body) currentElement = textNode;
+
+      // Traverse backwards to find <code-block>
+      let sibling = currentElement.previousSibling;
+      let targetCodeBlock: HTMLElement | null = null;
+      const nodesToMove: Node[] = [currentElement];
+
+      // Max search depth to prevent infinite loops
+      let steps = 0;
+      const MAX_STEPS = 50;
+
+      while (sibling && steps < MAX_STEPS) {
+        // Skip whitespace-only text nodes when looking for code-block
+        if (sibling.nodeType === Node.TEXT_NODE && !sibling.textContent?.trim()) {
+           // It's whitespace, but we should still move it if we find the block?
+           // Yes, include it in nodesToMove
+           nodesToMove.unshift(sibling);
+           sibling = sibling.previousSibling;
+           steps++;
+           continue;
+        }
+
+        if (sibling.nodeType === Node.ELEMENT_NODE) {
+          const el = sibling as HTMLElement;
+          if (el.tagName === 'CODE-BLOCK') {
+            targetCodeBlock = el;
+            break;
+          }
+        }
+
+        // Collect intervening nodes
+        nodesToMove.unshift(sibling);
+        sibling = sibling.previousSibling;
+        steps++;
+      }
+
+      if (targetCodeBlock) {
+        moveNodesToCodeBlock(targetCodeBlock as HTMLElement, nodesToMove);
+      }
+    });
+  });
+}
+
+function moveNodesToCodeBlock(codeBlock: HTMLElement, nodesToMove: Node[]) {
+  // 1. Mark the code block
+  if (!codeBlock.hasAttribute('data-gv-patching-code')) {
+    codeBlock.setAttribute('data-gv-patching-code', 'true');
+    codeBlock.setAttribute('data-gv-closers', '2'); // Initialize expecting 2 closers (inner + outer)
+
+    // 2. Append missing inner opener
+    // Find the internal container to append text to
+    const targetContainer = codeBlock.querySelector('pre') || codeBlock;
+    targetContainer.appendChild(document.createTextNode('\n```\n'));
+    logger.info('Started patching broken nested code block');
+  }
+
+  // 3. Extract and move content
+  const targetContainer = codeBlock.querySelector('pre') || codeBlock;
+  let accumulatedText = '';
+
+  nodesToMove.forEach((node) => {
+    // Extract text
+    let text = node.textContent || '';
+
+    // Add newline for block elements
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const tagName = (node as HTMLElement).tagName;
+      if (['P', 'DIV', 'LI', 'BR'].includes(tagName)) {
+        text += '\n';
+      }
+    }
+
+    accumulatedText += text;
+
+    // Remove the original node
+    if (node.parentNode) {
+      node.parentNode.removeChild(node);
+    }
+  });
+
+  // Append accumulated text
+  if (accumulatedText) {
+    targetContainer.appendChild(document.createTextNode(accumulatedText));
+  }
+
+  // 4. Update state (check for closers)
+  updatePatchState(codeBlock, accumulatedText);
+}
+
+function updatePatchState(codeBlock: HTMLElement, addedText: string) {
+  let expectedClosers = parseInt(codeBlock.getAttribute('data-gv-closers') || '0', 10);
+
+  // Regex to find backticks
+  // standalone ``` -> decrement
+  // ```lang -> increment
+  // Use non-whitespace to detect language
+  const regex = /```(\S*)/g;
+  let match;
+
+  while ((match = regex.exec(addedText)) !== null) {
+    const lang = match[1];
+    // If there's a language tag (even just one char), it's an opener
+    if (lang && lang.length > 0) {
+      expectedClosers++;
+    } else {
+      expectedClosers--;
+    }
+  }
+
+  codeBlock.setAttribute('data-gv-closers', expectedClosers.toString());
+
+  if (expectedClosers <= 0) {
+    // Done patching
+    codeBlock.removeAttribute('data-gv-patching-code');
+    codeBlock.removeAttribute('data-gv-closers');
+    // Clear timeout if exists
+    const existingTimeout = (codeBlock as any)._patchTimeout;
+    if (existingTimeout) clearTimeout(existingTimeout);
+    logger.info('Finished patching nested code block');
+  } else {
+      // Refresh timeout (safety net)
+      // "Every time you absorb nodes... reset a debounced timer... Forcefully remove attribute"
+      const existingTimeout = (codeBlock as any)._patchTimeout;
+      if (existingTimeout) clearTimeout(existingTimeout);
+
+      (codeBlock as any)._patchTimeout = setTimeout(() => {
+          if (codeBlock.hasAttribute('data-gv-patching-code')) {
+            codeBlock.removeAttribute('data-gv-patching-code');
+            codeBlock.removeAttribute('data-gv-closers');
+            logger.info('Force stopped patching due to timeout');
+          }
+      }, 1000);
+  }
+}
+
+/**
  * Starts the observer to patch broken markdown rendering in Gemini
  */
 export function startMarkdownPatcher() {
@@ -172,23 +343,81 @@ export function startMarkdownPatcher() {
 
   // Initial fix
   fixBrokenBoldTags(document.body);
+  fixNestedCodeBlocks(document.body);
+
+  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  const DEBOUNCE_MS = 50;
+
+  // Queue for nodes to be absorbed
+  let absorptionQueue: { block: HTMLElement, nodes: Node[] }[] = [];
 
   const observer = new MutationObserver((mutations) => {
-    // Collect all added nodes to scan them
+    // Clear queue reference on new batch? No, debounce handles it.
+
+    // Scan logic
     const nodesToScan: HTMLElement[] = [];
 
     for (const m of mutations) {
-      m.addedNodes.forEach((node) => {
-        if (node.nodeType === Node.ELEMENT_NODE) {
-          nodesToScan.push(node as HTMLElement);
-        }
-      });
+      for (const node of Array.from(m.addedNodes)) {
+          // Check for active absorption
+          let prev = node.previousSibling;
+
+          // Skip whitespace
+          while (prev && prev.nodeType === Node.TEXT_NODE && !prev.textContent?.trim()) {
+              prev = prev.previousSibling;
+          }
+
+          let targetBlock: HTMLElement | null = null;
+
+          if (prev && prev.nodeType === Node.ELEMENT_NODE) {
+              const el = prev as HTMLElement;
+              if (el.tagName === 'CODE-BLOCK' && el.hasAttribute('data-gv-patching-code')) {
+                  targetBlock = el;
+              } else {
+                  // Check if prev is in absorption queue
+                  const queued = absorptionQueue.find(e => e.nodes.includes(prev as Node));
+                  if (queued) {
+                      targetBlock = queued.block;
+                  }
+              }
+          }
+
+          if (targetBlock) {
+              // Add to absorption queue
+              let entry = absorptionQueue.find(e => e.block === targetBlock);
+              if (!entry) {
+                  entry = { block: targetBlock, nodes: [] };
+                  absorptionQueue.push(entry);
+              }
+              entry.nodes.push(node);
+          } else {
+              // Not absorbed, mark for scanning
+              if (node.nodeType === Node.ELEMENT_NODE) {
+                  nodesToScan.push(node as HTMLElement);
+              }
+          }
+      }
     }
 
+    // Process Absorption Queue (Debounced)
+    if (absorptionQueue.length > 0) {
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+            absorptionQueue.forEach(entry => {
+                if (entry.block.isConnected && entry.block.hasAttribute('data-gv-patching-code')) {
+                    moveNodesToCodeBlock(entry.block, entry.nodes);
+                }
+            });
+            absorptionQueue = []; // Clear queue
+        }, DEBOUNCE_MS);
+    }
+
+    // Process Scanning
     if (nodesToScan.length > 0) {
-      // Debounce or just run?
-      // Since specific nodes are added, running on them is usually fast.
-      nodesToScan.forEach((node) => fixBrokenBoldTags(node));
+      nodesToScan.forEach((node) => {
+        fixBrokenBoldTags(node);
+        fixNestedCodeBlocks(node);
+      });
     }
   });
 
