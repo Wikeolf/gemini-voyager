@@ -102,4 +102,41 @@ describe('fixNestedCodeBlocks', () => {
     // So it should still be patching waiting for the outer closer).
     expect(codeBlock.hasAttribute('data-gv-patching-code')).toBe(true);
   });
+
+  it('should handle deeply nested orphaned backticks', () => {
+    // Setup:
+    // <code-block>start</code-block>
+    // <div>
+    //   <ul>
+    //     <li>
+    //       <p>```</p>
+    //     </li>
+    //   </ul>
+    // </div>
+
+    const codeBlock = document.createElement('code-block');
+    codeBlock.textContent = 'start';
+    container.appendChild(codeBlock);
+
+    const div = document.createElement('div');
+    const ul = document.createElement('ul');
+    const li = document.createElement('li');
+    const p = document.createElement('p');
+    p.textContent = '```';
+
+    li.appendChild(p);
+    ul.appendChild(li);
+    div.appendChild(ul);
+    container.appendChild(div);
+
+    fixNestedCodeBlocks(container);
+    vi.advanceTimersByTime(100);
+
+    expect(container.childNodes.length).toBe(1); // Only code-block remains
+    expect(container.querySelector('div')).toBeNull();
+    const resultText = codeBlock.textContent || '';
+    expect(resultText).toContain('start');
+    expect(resultText).toContain('\n```\n'); // injected opener
+    expect(resultText).toContain('```'); // original closer
+  });
 });

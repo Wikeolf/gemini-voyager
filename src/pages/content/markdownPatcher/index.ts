@@ -206,41 +206,53 @@ export function fixNestedCodeBlocks(root: HTMLElement) {
       // If parent is body (unlikely for text node but possible), stay at text node
       if (currentElement === document.body) currentElement = textNode;
 
-      // Traverse backwards to find <code-block>
-      let sibling = currentElement.previousSibling;
+      // Traverse backwards and upwards to find the closest preceding <code-block>.
+      // We also need to collect the top-level nodes between the code-block and the orphaned node.
+      let walkerNode: Node | null = currentElement;
       let targetCodeBlock: HTMLElement | null = null;
-      const nodesToMove: Node[] = [currentElement];
+      let topLevelAncestorOfTextNode: Node = currentElement;
 
-      // Max search depth to prevent infinite loops
       let steps = 0;
       const MAX_STEPS = 50;
 
-      while (sibling && steps < MAX_STEPS) {
-        // Skip whitespace-only text nodes when looking for code-block
-        if (sibling.nodeType === Node.TEXT_NODE && !sibling.textContent?.trim()) {
-           nodesToMove.unshift(sibling);
-           sibling = sibling.previousSibling;
-           steps++;
-           continue;
-        }
-
-        if (sibling.nodeType === Node.ELEMENT_NODE) {
-          const el = sibling as HTMLElement;
-          if (el.tagName === 'CODE-BLOCK') {
-            targetCodeBlock = el;
-            logger.debug(`[fixNestedCodeBlocks] Found preceding <code-block> after ${steps} steps`);
+      while (walkerNode && walkerNode !== document.body && steps < MAX_STEPS) {
+        // Look at previous siblings
+        let prev = walkerNode.previousSibling;
+        while (prev) {
+          if (prev.nodeType === Node.ELEMENT_NODE && (prev as HTMLElement).tagName === 'CODE-BLOCK') {
+            targetCodeBlock = prev as HTMLElement;
             break;
           }
+          prev = prev.previousSibling;
         }
 
-        // Collect intervening nodes
-        nodesToMove.unshift(sibling);
-        sibling = sibling.previousSibling;
+        if (targetCodeBlock) break;
+
+        // If not found in siblings, move up to parent and set the ancestor tracker
+        walkerNode = walkerNode.parentNode;
+        if (walkerNode && walkerNode !== document.body) {
+          topLevelAncestorOfTextNode = walkerNode;
+        }
         steps++;
       }
 
       if (targetCodeBlock) {
-        moveNodesToCodeBlock(targetCodeBlock as HTMLElement, nodesToMove);
+        logger.debug(`[fixNestedCodeBlocks] Found preceding <code-block> after ${steps} steps`);
+
+        // Collect all nodes between the code block and the top-level ancestor containing the orphaned text
+        const nodesToMove: Node[] = [];
+        let siblingToMove = targetCodeBlock.nextSibling;
+
+        while (siblingToMove && siblingToMove !== topLevelAncestorOfTextNode) {
+          nodesToMove.push(siblingToMove);
+          siblingToMove = siblingToMove.nextSibling;
+        }
+        // Include the container of the text node itself
+        if (topLevelAncestorOfTextNode) {
+            nodesToMove.push(topLevelAncestorOfTextNode);
+        }
+
+        moveNodesToCodeBlock(targetCodeBlock, nodesToMove);
       } else {
         logger.debug(`[fixNestedCodeBlocks] Did not find preceding <code-block> within ${MAX_STEPS} steps.`);
       }
